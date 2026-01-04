@@ -12,20 +12,24 @@ logger = setup_logger(__name__)
 
 class ChatterboxDataset(Dataset):
     
-    def __init__(self, config):
+    def __init__(self, config, num_samples=None):
         self.cfg = config
         self.preprocessed_dir = config.preprocessed_dir
         
         # List only files with .pt extension
         if not os.path.exists(self.preprocessed_dir):
             raise FileNotFoundError(f"Preprocessing folder not found: {self.preprocessed_dir}.")
-            
-        self.files = [f for f in os.listdir(self.preprocessed_dir) if f.endswith(".pt")]
-        
-        if len(self.files) == 0:
-            raise RuntimeError(f"There are no .pt files in the folder: {self.preprocessed_dir}")
-            
-        logger.info(f"Dataset loaded. Total sample: {len(self.files)}")
+
+        # Get all .pt files (streaming with os.scandir for memory efficiency)
+        all_files = [f.name for f in os.scandir(self.preprocessed_dir) if f.name.endswith(".pt")]
+
+        # Limit to num_samples if specified (for memory efficiency)
+        if num_samples is not None and num_samples < len(all_files):
+            self.files = all_files[:num_samples]
+            logger.info(f"Dataset loaded. Total samples: {num_samples} (limited from {len(all_files)})")
+        else:
+            self.files = all_files
+            logger.info(f"Dataset loaded. Total samples: {len(self.files)}")
 
         self.sot_token = config.start_text_token 
         self.eot_token = config.stop_text_token
@@ -35,13 +39,18 @@ class ChatterboxDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        
+
         try:
-            
+
             filename = self.files[idx]
-            
+
             pt_path = os.path.join(self.preprocessed_dir, filename)
-            
+
+            # Safety check: ensure file exists before loading
+            if not os.path.exists(pt_path):
+                logger.error(f"File not found: {pt_path}")
+                return None
+
             data = torch.load(pt_path)
             
             

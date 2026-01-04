@@ -15,3 +15,6 @@ tensorboard
 omegaconf
 hf_transfer
 pyloudnorm
+# Added for PhoAudiobook dataset processing
+dask[dataframe]
+pyarrow
