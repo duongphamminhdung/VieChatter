@@ -3,24 +3,19 @@ from dataclasses import dataclass
 @dataclass
 class PhoAudiobookConfig:
     # --- Paths ---
-    # Directory where setup.py downloaded the pretrained models
-    model_dir: str = "./pretrained_models"
+    # Directory where setup.py downloaded the pretrained models (in Drive)
+    model_dir: str = "/content/drive/MyDrive/VieNP/pretrained_models"
     
     # Path to PhoAudiobook parquet file(s) - USE LOCAL PATH for faster access
     # Using /content/ for Colab (faster than Drive)
     # Files are in /content/phoaudiobook/data/ subdirectory
     parquet_path: str = "/content/phoaudiobook/data"
-    
-        # Preprocessed data output directory - USE LOCAL PATH for faster access
-        # Using /content/ for Colab (faster than Drive)
-    preprocessed_dir: str = "/content/phoaudiobook_preprocessed"
-    
-    # Output directory for finetuned model - USE LOCAL PATH for faster access
-    output_dir: str = "/content/models"
-    
+
+    # Output directory for finetuned model - Save to Google Drive
+    output_dir: str = "/content/drive/MyDrive/VieNP/models"
+
     # Dataset settings
-    dataset_format: str = "phoaudiobook"                      # Use PhoAudiobook parquet format
-    preprocess: bool = True                                # Set to False if you've already preprocessed
+    dataset_format: str = "phoaudiobook"  # Use PhoAudiobook parquet format
     
                            # Model type
     is_turbo: bool = True  # True for Turbo, False for Normal
@@ -28,15 +23,16 @@ class PhoAudiobookConfig:
     # --- Vocabulary ---
     # For Vietnamese, use the same tokenizer as the base model
     # Turbo mode typically uses a larger vocabulary
-    new_vocab_size: int = 52260 if True else 2454
+    new_vocab_size: int = 52260  # Fixed for Vietnamese dataset
     
     # --- Hyperparameters ---
     batch_size: int = 2  # Reduced for Colab free tier
     grad_accum: int = 4  # Effective batch size = 2 * 4 = 8
     learning_rate: float = 5e-5
-    num_epochs: int = 100  # Full training run for 100 epochs
-    save_freq_epochs: int = 10  # Save checkpoint every N epochs
-    save_total_limit: int = 10  # Keep last N checkpoints (inference files not affected)
+    num_epochs: int = 30  # Full training run for 30 epochs
+    save_steps_fixed: int = 5000  # Save checkpoint every N steps
+    save_at_epoch_end: bool = True  # Also save checkpoint at the end of each epoch
+    save_total_limit: int = 20  # Keep last N checkpoints (inference files not affected)
 
     # Inference message (Vietnamese greeting)
     inference_message: str = "Đây là đài Tiếng nói Việt Nam, phát thanh từ Hà Nội. Xin chào tất cả các bạn, tôi là Việt chatter, model text to speech được phát triển bởi Dpmd"

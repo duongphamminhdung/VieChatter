@@ -6,9 +6,8 @@ from safetensors.torch import save_file
 
 # Internal Modules
 from config_phoaudiobook import PhoAudiobookConfig
-from src.dataset import ChatterboxDataset, data_collator
+from src.dataset_parquet import ParquetDataset, data_collator_parquet, SequentialPartitionDataset
 from src.model import resize_and_load_t3_weights, ChatterboxTrainerWrapper
-from src.preprocess_phoaudiobook import preprocess_dataset_phoaudiobook
 from src.utils import setup_logger, check_pretrained_models
 
 # Chatterbox Imports
@@ -24,17 +23,41 @@ logger = setup_logger("ChatterboxPhoAudiobookFinetune")
 class InferenceCallback(TrainerCallback):
     """Callback to save inference files at each checkpoint."""
 
-    def __init__(self, model, tokenizer, message, output_dir):
+    def __init__(self, model, tokenizer, message, output_dir, save_steps=None, steps_per_epoch=None):
         self.model = model
         self.tokenizer = tokenizer
         self.message = message
         self.output_dir = output_dir
+        self.save_steps = save_steps
+        self.steps_per_epoch = steps_per_epoch
 
     def on_save(self, args, state, control):
         """Called when a checkpoint is saved."""
+        # Use provided save_steps or fall back to args.save_steps
+        check_step = self.save_steps if self.save_steps else args.save_steps
         # Only save at actual checkpoint saves (not intermediate saves)
-        if state.global_step % args.save_steps == 0:
+        if state.global_step % check_step == 0:
             self.save_inference_file(state.global_step)
+
+
+class EpochEndCallback(TrainerCallback):
+    """Callback to save additional checkpoints at the end of each epoch."""
+
+    def __init__(self, steps_per_epoch):
+        self.steps_per_epoch = steps_per_epoch
+        self.last_epoch_saved = -1
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        """Called at the end of each epoch."""
+        current_epoch = int(state.epoch)
+        
+        # Only save once per epoch (avoid duplicates)
+        if current_epoch > self.last_epoch_saved:
+            self.last_epoch_saved = current_epoch
+            logger.info(f"Saving epoch-end checkpoint for epoch {current_epoch}")
+            # Force save by updating control
+            control.should_save = True
+            control.should_log = True
 
     def save_inference_file(self, step):
         """Save an inference-ready file with the Vietnamese message."""
@@ -141,68 +164,83 @@ def main():
     for param in tts_engine_new.t3.parameters(): 
         param.requires_grad = True
 
-    # 6. PREPROCESS DATASET
-    if cfg.preprocess:
-        logger.info("Preprocessing PhoAudiobook dataset...")
-        logger.info(f"Reading from: {cfg.parquet_path}")
-        logger.info(f"Output to: {cfg.preprocessed_dir}")
-        preprocess_dataset_phoaudiobook(cfg, tts_engine_new)
-    else:
-        logger.info("Skipping preprocessing (using existing preprocessed data)")
+    # 6. INITIALIZING DATASET (NO PREPROCESSING NEEDED)
+    logger.info("Using Sequential ParquetDataset - reads parquet files sequentially and processes audio on-the-fly")
+    logger.info(f"Reading from: {cfg.parquet_path}")
+    logger.info("No preprocessing step required (saves time and storage)")
+
+    # Validate parquet path exists
+    if not os.path.exists(cfg.parquet_path):
+        raise FileNotFoundError(
+            f"Parquet directory does not exist: {cfg.parquet_path}\n"
+            f"Please verify the path in your config file."
+        )
+
+    # Initialize sequential dataset (processes partitions one at a time)
+    logger.info("Initializing Sequential Dataset...")
+    import multiprocessing as mp
+    num_dataloader_workers = min(mp.cpu_count(), 4)
+
+    from src.dataset_parquet import SequentialPartitionDataset, ParquetDataset
+
+    # Create base ParquetDataset
+    parquet_dataset = ParquetDataset(
+        cfg,
+        tts_engine=tts_engine_new,
+        split="train",
+        num_samples=cfg.max_samples
+    )
+
+    # Create sequential iterable dataset
+    train_ds = SequentialPartitionDataset(parquet_dataset)
+
+    num_train_samples    = len(train_ds)
+    steps_per_epoch      = num_train_samples // (cfg.batch_size * cfg.grad_accum)
+    total_training_steps = steps_per_epoch * cfg.num_epochs
     
-    # Check if preprocessed files exist before initializing dataset
-    if not os.path.exists(cfg.preprocessed_dir):
-        raise FileNotFoundError(
-            f"Preprocessed directory does not exist: {cfg.preprocessed_dir}\n"
-            f"Please set preprocess=True in config and run again."
-        )
-
-    # Count files efficiently (streaming, not loading all into RAM)
-    preprocessed_dir = cfg.preprocessed_dir
-    file_count       = 0
-    try:
-        with os.scandir(preprocessed_dir) as entries:
-            for entry in entries:
-                if entry.name.endswith('.pt'):
-                    file_count += 1
-    except OSError as e:
-        raise FileNotFoundError(f"Cannot read directory {preprocessed_dir}: {e}")
-
-    if file_count == 0:
-        raise FileNotFoundError(
-            f"No .pt files found in: {preprocessed_dir}\n"
-            f"Preprocessing may have failed. Please:\n"
-            f"1. Check that preprocess=True in config\n"
-            f"2. Verify parquet_path is correct: {cfg.parquet_path}\n"
-            f"3. Check preprocessing logs above for errors\n"
-            f"4. Try running preprocessing separately to debug"
-        )
+    # Use fixed step interval if configured, otherwise use epoch-based frequency
+    if hasattr(cfg, 'save_steps_fixed') and cfg.save_steps_fixed is not None:
+        save_steps = cfg.save_steps_fixed
+        logger.info(f"Using fixed step interval: {save_steps} steps per checkpoint")
     else:
-        logger.info(f"Found {file_count} preprocessed file(s)")
-
-    # Calculate save steps for epoch-based saving
-    # save_steps = (total_samples / (batch_size * grad_accum)) * save_freq_epochs
-    num_train_samples = len(preprocessed_files)
-    steps_per_epoch = num_train_samples // (cfg.batch_size * cfg.grad_accum)
-    save_steps = steps_per_epoch * getattr(cfg, 'save_freq_epochs', 10)
+        save_steps = steps_per_epoch * getattr(cfg, 'save_freq_epochs', 10)
+        logger.info(f"Using epoch-based frequency: {getattr(cfg, 'save_freq_epochs', 10)} epochs ({save_steps} steps)")
+    
+    # Check if saving at epoch end is enabled
+    save_at_epoch_end = getattr(cfg, 'save_at_epoch_end', False)
+    if save_at_epoch_end:
+        logger.info("Additional checkpoints will be saved at the end of each epoch")
 
     logger.info(f"Training samples: {num_train_samples}")
     logger.info(f"Steps per epoch: {steps_per_epoch}")
-    logger.info(f"Saving checkpoint every {getattr(cfg, 'save_freq_epochs', 10)} epochs ({save_steps} steps)")
-        
-    # 7. DATASET & WRAPPER
-    logger.info("Initializing Dataset...")
-    train_ds = ChatterboxDataset(cfg, num_samples=file_count)
+    logger.info(f"Total training steps: {total_training_steps}")
+    
+    if hasattr(cfg, 'save_steps_fixed') and cfg.save_steps_fixed is not None:
+        logger.info(f"Saving checkpoint every {save_steps} steps")
+        logger.info(f"Estimated time to first checkpoint: ~{save_steps * 1.78 / 3600:.1f} hours")
+    else:
+        logger.info(f"Saving checkpoint every {getattr(cfg, 'save_freq_epochs', 10)} epochs ({save_steps} steps)")
+    
+    logger.info(f"Using {num_dataloader_workers} workers for parallel processing within each partition")
 
-    model_wrapper = ChatterboxTrainerWrapper(tts_engine_new.t3)
+    model_wrapper = ChatterboxTrainerWrapper(tts_engine_new.t3, config=cfg)
 
     # Create inference callback to save Vietnamese greeting at each checkpoint
+    # Pass save_steps for consistent checkpoint frequency
     inference_callback = InferenceCallback(
         model=tts_engine_new.t3,
         tokenizer=tts_engine_new.tokenizer,
         message=cfg.inference_message,
-        output_dir=cfg.output_dir
+        output_dir=cfg.output_dir,
+        save_steps=save_steps,
+        steps_per_epoch=steps_per_epoch
     )
+
+    # Create epoch-end callback if enabled
+    callbacks = [inference_callback]
+    if save_at_epoch_end:
+        epoch_callback = EpochEndCallback(steps_per_epoch=steps_per_epoch)
+        callbacks.append(epoch_callback)
 
     # 8. TRAINING ARGUMENTS
     training_args = TrainingArguments(
@@ -211,12 +249,13 @@ def main():
         gradient_accumulation_steps=cfg.grad_accum,
         learning_rate=cfg.learning_rate,
         num_train_epochs=cfg.num_epochs,
+        max_steps=total_training_steps,  # Required for IterableDataset
         save_strategy="steps",
         save_steps=save_steps,
         logging_strategy="steps",
         logging_steps=50,
         remove_unused_columns=False,
-        dataloader_num_workers=2,  # Reduced for Colab
+        dataloader_num_workers=0,  # Already handled by SequentialPartitionDataset
         report_to=["tensorboard"],
         fp16=True if torch.cuda.is_available() else False,
         save_total_limit=getattr(cfg, 'save_total_limit', 10),  # Keep last N checkpoints
@@ -228,8 +267,8 @@ def main():
         model=model_wrapper,
         args=training_args,
         train_dataset=train_ds,
-        data_collator=data_collator,
-        callbacks=[inference_callback]  # Add inference callback
+        data_collator=data_collator_parquet,
+        callbacks=callbacks
     )
 
     logger.info("Starting Training Loop...")

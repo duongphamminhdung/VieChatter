@@ -80,8 +80,8 @@ for global_idx in random_indices:
     success = False
     error_msg = ""
 
-    try:
-        if audio_data is None:
+       try               : 
+    if audio_data is None: 
             error_msg = "Audio data is None"
         elif isinstance(audio_data, str):
             if os.path.exists(audio_data):

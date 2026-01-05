@@ -83,14 +83,14 @@ class ChatterboxTrainerWrapper(torch.nn.Module):
     """
     Wrapper class to calculate Loss inside the Forward pass for HuggingFace Trainer.
     """
-    
-    def __init__(self, t3_model):
-        
+
+    def __init__(self, t3_model, config=None):
         super().__init__()
         self.t3 = t3_model
-        
-        self.cfg = TrainConfig()
-        
+
+        # Use provided config or default to TrainConfig
+        self.cfg = config if config is not None else TrainConfig()
+
         if hasattr(t3_model.hp, 'speech_cond_prompt_len'):
             self.prompt_token_len = t3_model.hp.speech_cond_prompt_len
         else:
