@@ -1,6 +1,9 @@
 import os
 import sys
+import glob
 import torch
+import json
+import time
 from transformers import Trainer, TrainingArguments, TrainerCallback
 from safetensors.torch import save_file
 
@@ -18,6 +21,44 @@ from src.chatterbox_.models.t3.t3 import T3
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = setup_logger("ChatterboxPhoAudiobookFinetune")
+
+
+def log_gpu_info():
+    """Log GPU information and capabilities."""
+    if not torch.cuda.is_available():
+        logger.info("No CUDA GPU available")
+        return False
+    
+    device = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(device)
+    
+    logger.info(f"=== GPU Information ===")
+    logger.info(f"GPU: {device_properties.name}")
+    logger.info(f"Total Memory: {device_properties.total_memory / 1e9:.2f} GB")
+    logger.info(f"Compute Capability: {device_properties.major}.{device_properties.minor}")
+    logger.info(f"Multi-processors: {device_properties.multi_processor_count}")
+    logger.info(f"=====================")
+    
+    # Check for BF16 support
+    bf16_supported = torch.cuda.is_bf16_supported()
+    logger.info(f"BF16 Supported: {'YES ✓' if bf16_supported else 'NO ✗'}")
+    
+    # Check for Flash Attention support
+    flash_attn_available = False
+    try:
+        import flash_attn
+        flash_attn_available = True
+        logger.info(f"Flash Attention 2: Available ✓")
+    except ImportError:
+        logger.info(f"Flash Attention 2: Not Available (install with: pip install flash-attn)")
+    
+    # Check PyTorch version for compile support
+    torch_version = torch.__version__
+    compile_supported = int(torch_version.split('.')[0]) >= 2
+    logger.info(f"PyTorch {torch_version}")
+    logger.info(f"Torch Compile: {'Supported ✓' if compile_supported else 'Not Supported ✗'}")
+    
+    return True
 
 
 class InferenceCallback(TrainerCallback):
@@ -38,6 +79,144 @@ class InferenceCallback(TrainerCallback):
         # Only save at actual checkpoint saves (not intermediate saves)
         if state.global_step % check_step == 0:
             self.save_inference_file(state.global_step)
+
+
+class SpeedMonitorCallback(TrainerCallback):
+    """Callback to monitor and log training speed statistics."""
+    
+    def __init__(self):
+        self.last_log_time = None
+        self.last_log_step = None
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Called after each logging step."""
+        current_time = time.time()
+        current_step = state.global_step
+        
+        if self.last_log_time is not None and self.last_log_step is not None:
+            steps_since_last_log = current_step - self.last_log_step
+            time_since_last_log = current_time - self.last_log_time
+            
+            if steps_since_last_log > 0 and time_since_last_log > 0:
+                speed = steps_since_last_log / time_since_last_log  # steps per second
+                time_per_step = time_since_last_log / steps_since_last_log  # seconds per step
+                
+                # Log speed metrics
+                logger.info(f"Training Speed: {speed:.2f} steps/sec ({time_per_step:.2f} sec/step)")
+                
+                # Estimate remaining time
+                if state.max_steps > 0:
+                    steps_remaining = state.max_steps - current_step
+                    time_remaining_hours = (steps_remaining / speed) / 3600
+                    logger.info(f"Estimated time remaining: {time_remaining_hours:.1f} hours")
+        
+        self.last_log_time = current_time
+        self.last_log_step = current_step
+
+
+class MemoryMonitorCallback(TrainerCallback):
+    """Callback to monitor GPU memory usage during training."""
+    
+    def __init__(self, log_interval=50):
+        self.log_interval = log_interval
+        self.last_log_step = 0
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        """Called after each training step."""
+        if state.global_step - self.last_log_step >= self.log_interval:
+            if torch.cuda.is_available():
+                # Get memory usage
+                allocated = torch.cuda.memory_allocated() / 1e9  # GB
+                reserved = torch.cuda.memory_reserved() / 1e9  # GB
+                max_allocated = torch.cuda.max_memory_allocated() / 1e9  # GB
+                
+                logger.info(f"GPU Memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved, {max_allocated:.2f} GB max")
+                
+                # Reset max memory periodically
+                if state.global_step % (self.log_interval * 10) == 0:
+                    torch.cuda.reset_peak_memory_stats()
+            
+            self.last_log_step = state.global_step
+
+
+class SaveInitialModelCallback(TrainerCallback):
+    """Callback to save initial model state before training starts."""
+    
+    def __init__(self, model, output_dir): 
+        self.model = model
+        self.output_dir = output_dir
+        self.initial_model_saved = False
+    
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Called once at the beginning of training."""
+        if not self.initial_model_saved:
+            logger.info("=" * 60)
+            logger.info("SAVING INITIAL MODEL CHECKPOINT (STEP 0)")
+            logger.info("=" * 60)
+            
+            # Create checkpoint directory
+            checkpoint_dir = os.path.join(self.output_dir, "checkpoint-0")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            
+            # Save model weights manually
+            model_state = self.model.state_dict()
+            save_path = os.path.join(checkpoint_dir, "model.safetensors")
+            save_file(model_state, save_path)
+            
+            # Save training arguments
+            args_dict = {
+                "output_dir": self.output_dir,
+                "per_device_train_batch_size": args.per_device_train_batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "learning_rate": args.learning_rate,
+                "num_train_epochs": args.num_train_epochs,
+                "max_steps": args.max_steps,
+                "save_steps": args.save_steps,
+                "save_strategy": args.save_strategy,
+                "logging_steps": args.logging_steps,
+                "logging_strategy": args.logging_strategy,
+                "bf16": args.bf16,
+                "fp16": args.fp16,
+                "gradient_checkpointing": args.gradient_checkpointing,
+            }
+            
+            args_path = os.path.join(checkpoint_dir, "training_args.bin")
+            with open(args_path, "w") as f:
+                json.dump(args_dict, f)
+            
+            # Save trainer state
+            trainer_state = {
+                "epoch": 0.0,
+                "global_step": 0,
+                "log_history": [],
+            }
+            
+            state_path = os.path.join(checkpoint_dir, "trainer_state.json")
+            with open(state_path, "w") as f:
+                json.dump(trainer_state, f)
+            
+            # Save config (only if model has config attribute)
+            if hasattr(self.model, 'config') and self.model.config is not None:
+                try:
+                    config = self.model.config
+                    config_path = os.path.join(checkpoint_dir, "config.json")
+                    if hasattr(config, 'to_dict'):
+                        config_dict = config.to_dict()
+                    else:
+                        config_dict = str(config)
+                    with open(config_path, "w") as f:
+                        json.dump(config_dict, f)
+                    logger.info(f"  - Model config: {config_path}")
+                except Exception as e:
+                    logger.warning(f"Could not save model config: {e}")
+            
+            self.initial_model_saved = True
+            
+            logger.info(f"✓ Initial checkpoint saved to: {checkpoint_dir}")
+            logger.info(f"  - Model weights: {save_path}")
+            logger.info(f"  - Training args: {args_path}")
+            logger.info(f"  - Trainer state: {state_path}")
+            logger.info("=" * 60)
 
 
 class EpochEndCallback(TrainerCallback):
@@ -86,6 +265,41 @@ class EpochEndCallback(TrainerCallback):
         logger.info(f"Message: {self.message}")
 
 
+def find_latest_checkpoint(output_dir):
+    """Find the latest checkpoint in the output directory.
+    
+    Returns:
+        str or None: Path to the latest checkpoint directory, or None if no checkpoint exists.
+    """
+    # Look for checkpoint directories
+    checkpoint_pattern = os.path.join(output_dir, "checkpoint-*")
+    checkpoint_dirs = glob.glob(checkpoint_pattern)
+    
+    if not checkpoint_dirs:
+        return None
+    
+    # Extract step numbers from checkpoint names
+    checkpoint_with_steps = []
+    for checkpoint_dir in checkpoint_dirs:
+        try:
+            # Extract the number from checkpoint-XXXXX
+            step_num = int(checkpoint_dir.split("-")[-1])
+            checkpoint_with_steps.append((step_num, checkpoint_dir))
+        except (ValueError, IndexError):
+            # Skip malformed checkpoint names
+            continue
+    
+    if not checkpoint_with_steps:
+        return None
+    
+    # Sort by step number (descending) and return the latest
+    checkpoint_with_steps.sort(key=lambda x: x[0], reverse=True)
+    latest_step, latest_checkpoint = checkpoint_with_steps[0]
+    
+    logger.info(f"Found latest checkpoint: {latest_checkpoint} (step {latest_step})")
+    return latest_checkpoint
+  
+
 def main():
     
     cfg = PhoAudiobookConfig()
@@ -99,6 +313,9 @@ def main():
     if not check_pretrained_models(mode=mode_check):
         logger.error("Pretrained models not found. Please run setup.py first.")
         sys.exit(1)
+    
+    # Log GPU information
+    log_gpu_info()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
@@ -225,6 +442,43 @@ def main():
 
     model_wrapper = ChatterboxTrainerWrapper(tts_engine_new.t3, config=cfg)
 
+    # Enable torch.compile for A100 acceleration (PyTorch 2.0+)
+    use_torch_compile = getattr(cfg, 'use_torch_compile', True)
+    if use_torch_compile and torch.cuda.is_available():
+        try:
+            torch_version = torch.__version__
+            major_version = int(torch_version.split('.')[0])
+            
+            if major_version >= 2:
+                logger.info("=== Enabling torch.compile for acceleration ===")
+                logger.info(f"PyTorch {torch_version} detected - compiling model...")
+                
+                # Compile the model wrapper for faster execution
+                # mode="max-autotune" - maximum optimization, slower initial compile but fastest execution
+                # mode="reduce-overhead" - balance between compile time and execution speed
+                compile_mode = "reduce-overhead"  # Good balance for training
+                model_wrapper = torch.compile(
+                    model_wrapper,
+                    mode=compile_mode,
+                    fullgraph=False  # Safe for training
+                )
+                logger.info(f"✓ Model compiled successfully with mode='{compile_mode}'")
+                logger.info("  Expect 20-50% speedup after first few batches")
+            else:
+                logger.warning(f"PyTorch {torch_version} < 2.0 - torch.compile not available")
+        except Exception as e:
+            logger.warning(f"Failed to compile model: {e}")
+            logger.warning("Continuing without torch.compile")
+
+    # Check for Flash Attention 2
+    use_flash_attention = getattr(cfg, 'use_flash_attention', True)
+    if use_flash_attention:
+        try:
+            import flash_attn
+            logger.info("✓ Flash Attention 2 is available - will be used if supported by model")
+        except ImportError:
+            logger.info("Flash Attention 2 not available - install with: pip install flash-attn")
+
     # Create inference callback to save Vietnamese greeting at each checkpoint
     # Pass save_steps for consistent checkpoint frequency
     inference_callback = InferenceCallback(
@@ -237,12 +491,35 @@ def main():
     )
 
     # Create epoch-end callback if enabled
-    callbacks = [inference_callback]
+    callbacks = [
+        SaveInitialModelCallback(model_wrapper, cfg.output_dir),  # Save initial model at step 0
+        inference_callback, 
+        SpeedMonitorCallback(),  # Monitor training speed
+        MemoryMonitorCallback(log_interval=50)  # Monitor GPU memory
+    ]
     if save_at_epoch_end:
         epoch_callback = EpochEndCallback(steps_per_epoch=steps_per_epoch)
         callbacks.append(epoch_callback)
 
-    # 8. TRAINING ARGUMENTS
+    # Check for resume from checkpoint
+    resume_path = None
+    if getattr(cfg, 'resume_from_checkpoint', False):
+        logger.info("Resume from checkpoint enabled. Searching for latest checkpoint...")
+        resume_path = find_latest_checkpoint(cfg.output_dir)
+        if resume_path:
+            logger.info(f"Will resume training from: {resume_path}")
+        else:
+            logger.warning(f"No checkpoint found in {cfg.output_dir}. Starting fresh training.")
+
+    # 8. TRAINING ARGUMENTS - Optimized for A100 GPU
+    # Determine precision settings
+    use_bf16 = getattr(cfg, 'use_bf16', True) and torch.cuda.is_bf16_supported()
+    use_fp16 = not use_bf16 and torch.cuda.is_available()
+    
+    logger.info(f"=== Precision Settings ===")
+    logger.info(f"BF16: {use_bf16}")
+    logger.info(f"FP16: {use_fp16}")
+    
     training_args = TrainingArguments(
         output_dir=cfg.output_dir,
         per_device_train_batch_size=cfg.batch_size,
@@ -255,12 +532,28 @@ def main():
         logging_strategy="steps",
         logging_steps=50,
         remove_unused_columns=False,
-        dataloader_num_workers=0,  # Already handled by SequentialPartitionDataset
+        dataloader_num_workers=4,  # Parallel data loading for better throughput
         report_to=["tensorboard"],
-        fp16=True if torch.cuda.is_available() else False,
+        
+        # Precision - A100 optimized
+        bf16=use_bf16,  # Native A100 support, better than FP16
+        fp16=use_fp16,
+        
+        # Checkpointing
         save_total_limit=getattr(cfg, 'save_total_limit', 10),  # Keep last N checkpoints
-        gradient_checkpointing=True,
+        gradient_checkpointing=True,  # Reduces VRAM usage by ~60%
+        
+        # Memory optimization
         dataloader_pin_memory=True,
+        
+        # Learning rate scheduling - better convergence
+        warmup_ratio=0.01,  # 1% warmup
+        lr_scheduler_type="cosine",  # Smooth cosine decay
+        
+        # Performance optimizations
+        ddp_find_unused_parameters=False,  # Faster DDP
+        # dataloader_prefetch_factor=2,  # Prefetch next batches
+        # gradient_accumulation_kwargs=None,
     )
 
     trainer = Trainer(
@@ -273,7 +566,9 @@ def main():
 
     logger.info("Starting Training Loop...")
     logger.info(f"Effective batch size: {cfg.batch_size * cfg.grad_accum}")
-    trainer.train()
+    
+    # Train with or without resuming from checkpoint
+    trainer.train(resume_from_checkpoint=resume_path)
 
     # 9. SAVE FINAL MODEL
     logger.info("Training complete. Saving model...")

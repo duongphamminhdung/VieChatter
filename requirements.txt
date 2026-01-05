@@ -18,3 +18,13 @@ pyloudnorm
 # Added for PhoAudiobook dataset processing
 dask[dataframe]
 pyarrow
+
+# Acceleration packages for A100 GPU
+# Flash Attention 2 - 2-4x faster attention computation
+flash-attn>=2.0.0; platform_system == "Linux"
+
+# 8-bit optimizers - less memory, faster training
+bitsandbytes>=0.41.0
+
+# Apex - fused operations for faster training
+# apex>=0.1
