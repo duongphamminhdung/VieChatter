@@ -4,7 +4,6 @@ import numpy as np
 import soundfile as sf
 import random
 import re
-from safetensors.torch import load_file
 
 
 from src.utils import setup_logger, trim_silence_with_vad
@@ -26,16 +25,16 @@ OUTPUT_DIR = cfg.output_dir
 
 
 if IS_TURBO:
-    
-    FINETUNED_WEIGHTS = os.path.join(OUTPUT_DIR, "t3_turbo_finetuned.safetensors")
+
+    FINETUNED_WEIGHTS = os.path.join(OUTPUT_DIR, "t3_turbo_finetuned.pt")
     PARAMS = {
         "temperature": 0.8,
         "exaggeration": 0.5,
         "repetition_penalty": 1.2,
     }
 else:
-    
-    FINETUNED_WEIGHTS = os.path.join(OUTPUT_DIR, "t3_finetuned.safetensors")
+
+    FINETUNED_WEIGHTS = os.path.join(OUTPUT_DIR, "t3_finetuned.pt")
     PARAMS = {
         "temperature": 0.8,
         "exaggeration": 0.5,
@@ -77,7 +76,7 @@ def load_finetuned_engine(device):
     
     if os.path.exists(FINETUNED_WEIGHTS):
         logger.info(f"Loading fine-tuned weights: {FINETUNED_WEIGHTS}")
-        state_dict = load_file(FINETUNED_WEIGHTS, device="cpu")
+        state_dict = torch.load(FINETUNED_WEIGHTS, map_location="cpu")
         new_t3.load_state_dict(state_dict, strict=True)
         logger.info("Fine-tuned weights loaded successfully.")
     else:

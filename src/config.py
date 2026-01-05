@@ -31,10 +31,23 @@ class TrainConfig:
     new_vocab_size: int = 52260 if is_turbo else 2454 
 
     # --- Hyperparameters ---
-    batch_size: int = 4         # Adjust based on VRAM (2, 4, 8)
-    grad_accum: int = 2        # Effective Batch Size = Batch * Accum
+    batch_size: int = 16        # Optimized for A100
+    grad_accum: int = 2        # Effective Batch Size = 16 * 2 = 32
     learning_rate: float = 5e-5 # T3 is sensitive, keep low
-    num_epochs: int = 250
+    num_epochs: int = 30
+    
+    # --- Acceleration Settings ---
+    use_bf16: bool = True  # Use BF16 precision (A100 optimized)
+    use_torch_compile: bool = True  # Enable torch.compile for 20-50% speedup
+    use_flash_attention: bool = True  # Use Flash Attention 2 if available
+    
+    # --- Checkpointing ---
+    save_steps_fixed: int = 5000  # Save checkpoint every N steps
+    save_at_epoch_end: bool = True  # Also save checkpoint at the end of each epoch
+    save_total_limit: int = 10  # Keep last N checkpoints (inference files not affected)
+    
+    # --- Resume Training ---
+    resume_from_checkpoint: bool = False  # Set True to resume from latest checkpoint
 
     # --- Constraints ---
     start_text_token = 255
