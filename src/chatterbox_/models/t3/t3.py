@@ -93,11 +93,28 @@ class T3(nn.Module):
     def prepare_conditioning(self, t3_cond: T3Cond):
         """
         Token cond data needs to be embedded, so that needs to be here instead of in `T3CondEnc`.
+        
+        IMPORTANT: To avoid CUDAGraphs issues, we create a new T3Cond object instead of 
+        modifying the input in-place. This prevents "accessing tensor output of CUDAGraphs 
+        that has been overwritten" errors during training.
         """
         if t3_cond.cond_prompt_speech_tokens is not None and t3_cond.cond_prompt_speech_emb is None:
-            t3_cond.cond_prompt_speech_emb = self.speech_emb(t3_cond.cond_prompt_speech_tokens)
+            # Compute the embedding
+            cond_prompt_speech_emb = self.speech_emb(t3_cond.cond_prompt_speech_tokens)
             if not self.is_gpt:
-                t3_cond.cond_prompt_speech_emb += self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
+                cond_prompt_speech_emb = cond_prompt_speech_emb + self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
+            
+            # Create a new T3Cond object instead of modifying the input in-place
+            # This avoids CUDAGraphs capturing the in-place modification
+            t3_cond_with_emb = T3Cond(
+                speaker_emb=t3_cond.speaker_emb,
+                clap_emb=t3_cond.clap_emb,
+                cond_prompt_speech_tokens=t3_cond.cond_prompt_speech_tokens,
+                cond_prompt_speech_emb=cond_prompt_speech_emb,
+                emotion_adv=t3_cond.emotion_adv
+            )
+            return self.cond_enc(t3_cond_with_emb)
+        
         return self.cond_enc(t3_cond)  # (B, len_cond, dim)
 
     def prepare_input_embeds(

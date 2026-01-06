@@ -340,20 +340,45 @@ class SequentialPartitionDataset(torch.utils.data.IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
 
         if worker_info is None:
-            # Single worker mode - process all partitions
+                    # Single worker mode - process all partitions sequentially
             for partition_idx in range(self.dataset.npartitions):
                 self._load_partition(partition_idx)
-                for idx in range(len(self.partition_data)):
-                    yield self._process_row(idx)
+                partition_size = len(self.partition_data)
+                
+                # Add progress bar to show processing within partition
+                with tqdm(total=partition_size, 
+                         desc=f"Partition {partition_idx+1}/{self.dataset.npartitions}",
+                         unit=" samples",
+                         leave=False) as pbar:
+                    for idx in range(partition_size):
+                        sample = self._process_row(idx)
+                        if sample is not None:  # Skip None samples (errors)
+                            yield sample
+                        pbar.update(1)
         else:
-            # Multi-worker mode - each worker gets different partitions
+            # Multi-worker mode - each worker processes DIFFERENT partitions
+            # This avoids 4x memory usage from loading same partition 4 times
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
 
+            # Each worker gets its own subset of partitions
+            # Worker 0: partitions 0, 4, 8, 12...
+            # Worker 1: partitions 1, 5, 9, 13...
             for partition_idx in range(worker_id, self.dataset.npartitions, num_workers):
                 self._load_partition(partition_idx)
-                for idx in range(len(self.partition_data)):
-                    yield self._process_row(idx)
+                partition_size = len(self.partition_data)
+                
+                # Add progress bar per worker
+                with tqdm(total=partition_size,
+                         desc     = f"[W{worker_id}] Partition {partition_idx+1}",
+                         unit     = " samples",
+                         position = worker_id,
+                         leave    = False) as pbar:
+                    for idx in range(partition_size):
+                        sample = self._process_row(idx)
+                        if sample is not None:  # Skip None samples (errors)
+                            yield sample
+                        pbar.update(1)
 
     def _load_partition(self, partition_idx):
         """Load a single partition."""
@@ -371,29 +396,39 @@ class SequentialPartitionDataset(torch.utils.data.IterableDataset):
             return None
 
 
-def create_sequential_parquet_dataloader(config, tts_engine, split="train", num_samples=None, batch_size=8, num_workers=4):
+def create_sequential_parquet_dataloader(config, tts_engine, split="train", num_samples=None, batch_size=8, num_workers=0):
     """
     Create a DataLoader that processes partitions sequentially.
-    - Each partition is fully loaded
-    - Workers process samples within the partition in parallel
-    - Then moves to next partition
+    - Each partition is fully loaded into RAM
+    - All samples in partition are processed before moving to next partition
+    - This ensures one partition at a time = memory efficient
+    
+    IMPORTANT: Use num_workers=0 for true sequential partition processing.
+    With num_workers>0, each worker loads different partitions simultaneously (4x memory usage).
     """
     dataset = ParquetDataset(config, tts_engine, split=split, num_samples=num_samples)
 
     # Create sequential iterable dataset
     sequential_dataset = SequentialPartitionDataset(dataset)
 
-    # Create DataLoader with multiple workers
+    # Create DataLoader with num_workers=0 for sequential partition processing
     dataloader = torch.utils.data.DataLoader(
         sequential_dataset,
         batch_size  = batch_size,
         collate_fn  = data_collator_parquet,
-        num_workers = num_workers,
+        num_workers = num_workers,  # 0 for sequential, >0 for parallel (uses more RAM)
         pin_memory  = True
     )
 
-    logger.info(f"Created Sequential DataLoader with {num_workers} workers")
-    logger.info(f"Processing {dataset.npartitions} partitions sequentially")
+    if num_workers == 0:
+        logger.info(f"Created Sequential DataLoader (single worker - memory efficient)")
+        logger.info(f"  Processing {dataset.npartitions} partitions one at a time")
+        logger.info(f"  Memory usage: 1 partition in RAM at a time")
+    else:
+        logger.info(f"Created Sequential DataLoader with {num_workers} workers")
+        logger.info(f"  WARNING: Each worker loads different partitions simultaneously")
+        logger.info(f"  Memory usage: {num_workers} partitions in RAM simultaneously")
+    
     logger.info(f"Total samples: {len(dataloader.dataset.dataset)}")
 
     return dataloader, dataset

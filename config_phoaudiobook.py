@@ -26,14 +26,16 @@ class PhoAudiobookConfig:
     new_vocab_size: int = 52260  # Fixed for Vietnamese dataset
     
                           # --- Hyperparameters ---
-    batch_size: int = 16  # Optimized for A100 GPU
-    grad_accum: int = 2   # Effective batch size = 16 * 2 = 32
+    batch_size: int = 4   # Reduced from 16 to prevent OOM (if OOM occurs, reduce to 4)
+    grad_accum: int = 4   # Increased from 2 to maintain effective batch size = 8 * 4 = 32
     learning_rate: float = 5e-5
     num_epochs    : int  = 30    # Full training run for 30 epochs
     
                                        # --- Acceleration Settings ---
     use_bf16            : bool = True  # Use BF16 precision (A100 optimized)
-    use_torch_compile   : bool = True  # Enable torch.compile for 20-50% speedup
+    use_torch_compile   : bool = False  # Enable torch.compile for 20-50% speedup
+                                        # Set to False if FX symbolic shape errors cause hangs
+                                        # (torch/fx/experimental/recording.py errors)
     use_flash_attention: bool = True   # Use Flash Attention 2 if available
     save_steps_fixed    : int = 5000   # Save checkpoint every N steps
     save_at_epoch_end   : bool = True  # Also save checkpoint at the end of each epoch
