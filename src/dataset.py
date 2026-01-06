@@ -1,4 +1,5 @@
 import os
+import glob
 import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
@@ -11,11 +12,11 @@ logger = setup_logger(__name__)
 
 
 class ChatterboxDataset(Dataset):
-    
+
     def __init__(self, config, num_samples=None):
         self.cfg = config
         self.preprocessed_dir = config.preprocessed_dir
-        
+
         # List only files with .pt extension
         if not os.path.exists(self.preprocessed_dir):
             raise FileNotFoundError(f"Preprocessing folder not found: {self.preprocessed_dir}.")
@@ -23,41 +24,51 @@ class ChatterboxDataset(Dataset):
         # Get all .pt files (streaming with os.scandir for memory efficiency)
         all_files = [f.name for f in os.scandir(self.preprocessed_dir) if f.name.endswith(".pt")]
 
-        # Limit to num_samples if specified (for memory efficiency)
-        if num_samples is not None and num_samples < len(all_files):
-            self.files = all_files[:num_samples]
-            logger.info(f"Dataset loaded. Total samples: {num_samples} (limited from {len(all_files)})")
-        else:
-            self.files = all_files
-            logger.info(f"Dataset loaded. Total samples: {len(self.files)}")
+        # Load all partition files to create a flat list of samples
+        self.samples = []
+        for filename in all_files:
+            pt_path = os.path.join(self.preprocessed_dir, filename)
 
-        self.sot_token = config.start_text_token 
+            try:
+                data = torch.load(pt_path, map_location='cpu')
+
+                # Each partition file contains a list of samples (new format)
+                if isinstance(data, list):
+                    self.samples.extend(data)
+                    logger.info(f"Loaded {len(data):,} samples from {filename}")
+                else:
+                    # Legacy format: single sample
+                    self.samples.append(data)
+                    logger.info(f"Loaded 1 sample from {filename} (legacy format)")
+
+            except Exception as e:
+                logger.warning(f"Warning: Could not load {filename}: {e}")
+
+        # Limit to num_samples if specified (for memory efficiency)
+        if num_samples is not None and num_samples < len(self.samples):
+            self.samples = self.samples[:num_samples]
+            logger.info(f"Dataset loaded. Total samples: {num_samples} (limited from {len(self.samples)})")
+        else:
+            logger.info(f"Dataset loaded. Total samples: {len(self.samples)}")
+
+        self.sot_token = config.start_text_token
         self.eot_token = config.stop_text_token
 
 
     def __len__(self):
-        return len(self.files)
+        return len(self.samples)
 
     def __getitem__(self, idx):
 
         try:
 
-            filename = self.files[idx]
+            data = self.samples[idx]
 
-            pt_path = os.path.join(self.preprocessed_dir, filename)
-
-            # Safety check: ensure file exists before loading
-            if not os.path.exists(pt_path):
-                logger.error(f"File not found: {pt_path}")
-                return None
-
-            data = torch.load(pt_path)
-            
-            
+            # 1. Text Tokens
             text_tokens = data["text_tokens"]
             if text_tokens.size(0) > self.cfg.max_text_len - 2:
                 text_tokens = text_tokens[:self.cfg.max_text_len - 2]
-                
+
             sot = torch.tensor([self.sot_token], dtype=torch.long)
             eot = torch.tensor([self.eot_token], dtype=torch.long)
             text_tokens = torch.cat([sot, text_tokens, eot])
@@ -76,7 +87,7 @@ class ChatterboxDataset(Dataset):
 
 
         except Exception as e:
-            logger.error(f"Error loading {filename}: {e}")
+            logger.error(f"Error loading sample {idx}: {e}")
             return None
 
 

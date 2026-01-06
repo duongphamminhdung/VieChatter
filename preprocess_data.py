@@ -18,6 +18,7 @@ Key Optimizations:
 import os
 import glob
 import gc
+import uuid
 import torch
 import torchaudio
 import dask.dataframe as dd
@@ -464,13 +465,15 @@ def preprocess():
     logger.info("✓ Models loaded and optimized")
     
     # ===== STORAGE FOR PREPROCESSED DATA =====
-    all_speech_tokens = []
-    all_speaker_emb = []
-    all_prompt_tokens = []
-    all_text_tokens = []
-    
+    # We'll accumulate samples and save per partition
+    partition_speech_tokens = []
+    partition_speaker_emb = []
+    partition_prompt_tokens = []
+    partition_text_tokens = []
+
     success = 0
     skipped = 0
+    partition_count = 0
     
     # Overall progress bar
     logger.info(f"\nProcessing in batches of {IO_BATCH_SIZE} samples (I/O) and {GPU_BATCH_SIZE} samples (GPU)...")
@@ -545,10 +548,10 @@ def preprocess():
                     )
                     
                     # Store results
-                    all_speech_tokens.extend(speech)
-                    all_speaker_emb.extend(embs)
-                    all_prompt_tokens.extend(prompts)
-                    all_text_tokens.extend(text)
+                    partition_speech_tokens.extend(speech)
+                    partition_speaker_emb.extend(embs)
+                    partition_prompt_tokens.extend(prompts)
+                    partition_text_tokens.extend(text)
                     
                     success += len(gpu_batch)
                     
@@ -567,10 +570,10 @@ def preprocess():
                             speech, embs, prompts, text = process_batch_on_gpu(
                                 [single_sample], tts_engine, device
                             )
-                            all_speech_tokens.extend(speech)
-                            all_speaker_emb.extend(embs)
-                            all_prompt_tokens.extend(prompts)
-                            all_text_tokens.extend(text)
+                            partition_speech_tokens.extend(speech)
+                            partition_speaker_emb.extend(embs)
+                            partition_prompt_tokens.extend(prompts)
+                            partition_text_tokens.extend(text)
                             success += 1
                             del speech, embs, prompts, text
                             if device.type == 'cuda':
@@ -607,44 +610,54 @@ def preprocess():
             if device.type == 'cuda' and batch_num % 10 == 0:
                 torch.cuda.empty_cache()
                 gc.collect()
-    
+
+        # ===== SAVE PARTITION DATA =====
+        # After processing all batches in this partition, save to a single .pt file
+        if len(partition_speech_tokens) > 0:
+            partition_count += 1
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+            # Save partition data as a list of samples (not stacked)
+            partition_samples = []
+            num_samples_in_partition = len(partition_speech_tokens)
+
+            for i in range(num_samples_in_partition):
+                sample = {
+                    "speech_tokens": partition_speech_tokens[i],
+                    "speaker_emb": partition_speaker_emb[i],
+                    "prompt_tokens": partition_prompt_tokens[i],
+                    "text_tokens": partition_text_tokens[i],
+                }
+                partition_samples.append(sample)
+
+            # Save partition to file
+            partition_filename = f"partition_{part_idx:04d}_{num_samples_in_partition}samples.pt"
+            partition_path = os.path.join(OUTPUT_DIR, partition_filename)
+            torch.save(partition_samples, partition_path)
+
+            logger.info(f"  ✓ Saved partition {part_idx+1}/{n_partitions}: {num_samples_in_partition:,} samples → {partition_filename}")
+
+            # Clear partition data to free memory
+            partition_speech_tokens.clear()
+            partition_speaker_emb.clear()
+            partition_prompt_tokens.clear()
+            partition_text_tokens.clear()
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+        else:
+            logger.warning(f"  ⚠ No valid samples in partition {part_idx+1}/{n_partitions}, skipping save...")
+
     pbar.close()
-    
-    # ===== FINALIZE: STACK AND SAVE =====
-    logger.info("\n" + "=" * 80)
-    logger.info("FINALIZING: Stacking tensors and saving...")
-    logger.info("=" * 80)
-    
-    if success == 0:
-        logger.error("No samples were successfully processed! Check your data format.")
-        return
-    
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    output_path = os.path.join(OUTPUT_DIR, "preprocessed_all.pt")
-    
-    logger.info(f"Stacking {success:,} samples...")
-    
-    # Stack all tensors
-    final_data = {
-        "speech_tokens": torch.stack(all_speech_tokens),
-        "speaker_emb": torch.stack(all_speaker_emb),
-        "prompt_tokens": torch.stack(all_prompt_tokens),
-        "text_tokens": torch.stack(all_text_tokens),
-    }
-    
-    logger.info(f"Saving to: {output_path}")
-    torch.save(final_data, output_path)
-    
-    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    
+
     # ===== FINAL SUMMARY =====
-    logger.info("=" * 80)
+    logger.info("\n" + "=" * 80)
     logger.info("✓ PREPROCESSING COMPLETE!")
     logger.info("=" * 80)
     logger.info(f"Successfully processed: {success:,} samples ({100*success/total_samples:.1f}%)")
     logger.info(f"Skipped/Failed: {skipped:,} samples ({100*skipped/total_samples:.1f}%)")
-    logger.info(f"Output file: {output_path}")
-    logger.info(f"File size: {file_size_mb:.2f} MB")
+    logger.info(f"Output directory: {OUTPUT_DIR}")
+    logger.info(f"Saved as: {partition_count} partition files (one .pt file per parquet partition)")
     logger.info("=" * 80)
     logger.info("\nOPTIMIZATIONS APPLIED:")
     logger.info("  ✓ Pinned memory for 2x faster CPU-GPU transfers")
@@ -655,6 +668,7 @@ def preprocess():
     logger.info("  ✓ TF32 acceleration enabled")
     logger.info("  ✓ Dynamic batch sizing per GPU type")
     logger.info("  ✓ Aggressive memory management")
+    logger.info("  ✓ Partition-based saving (reduces file count)")
     logger.info("=" * 80)
     logger.info("\nNEXT STEP:")
     logger.info("  python train_preprocessed_phoaudiobook.py")

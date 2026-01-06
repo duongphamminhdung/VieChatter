@@ -10,8 +10,9 @@ import json
 import torch
 import time
 import glob
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from transformers import Trainer, TrainingArguments, TrainerCallback
+from torch.nn.utils.rnn import pad_sequence
 
 # Internal Modules
 from src.config_phoaudiobook import PhoAudiobookConfig
@@ -30,38 +31,54 @@ logger = setup_logger("ChatterboxPhoAudiobookFinetune-Preprocessed")
 
 
 class PreprocessedDataset(Dataset):
-    """Dataset that loads preprocessed .pt files."""
-    
+    """Dataset that loads preprocessed .pt files (partition-based format)."""
+
     def __init__(self, preprocessed_dir, max_samples=None):
         self.preprocessed_dir = preprocessed_dir
-        
+
         # Get all .pt files
         all_files = sorted(glob.glob(os.path.join(preprocessed_dir, "*.pt")))
-        
+
+        # Load all partition files to create a flat list of samples
+        self.samples = []
+        for file_path in all_files:
+            try:
+                # Load partition (contains list of samples)
+                partition_data = torch.load(file_path, map_location='cpu')
+
+                # Each partition file contains a list of samples
+                if isinstance(partition_data, list):
+                    self.samples.extend(partition_data)
+                    logger.info(f"Loaded {len(partition_data):,} samples from {os.path.basename(file_path)}")
+                else:
+                    # Legacy format: single sample
+                    self.samples.append(partition_data)
+                    logger.info(f"Loaded 1 sample from {os.path.basename(file_path)} (legacy format)")
+
+            except Exception as e:
+                logger.warning(f"Warning: Could not load {file_path}: {e}")
+
+        logger.info(f"Total samples loaded: {len(self.samples):,}")
+
         # Limit samples if specified
-        if max_samples is not None and max_samples < len(all_files):
-            all_files = all_files[:max_samples]
-        
-        self.files = all_files
-        logger.info(f"Found {len(self.files)} preprocessed samples")
-        
+        if max_samples is not None and max_samples < len(self.samples):
+            self.samples = self.samples[:max_samples]
+            logger.info(f"Limited to {max_samples:,} samples")
+
     def __len__(self):
-        return len(self.files)
-    
+        return len(self.samples)
+
     def __getitem__(self, idx):
         """Load a preprocessed sample."""
-        file_path = self.files[idx]
-        
+        sample = self.samples[idx]
+
         try:
-            # Load preprocessed data
-            data = torch.load(file_path, map_location='cpu')
-            
             # Convert tensors to correct format
-            speech_tokens = data['speech_tokens'].long()
-            speaker_emb = data['speaker_emb'].float()
-            prompt_tokens = data['prompt_tokens'].long()
-            text_tokens = data['text_tokens'].long()
-            
+            speech_tokens = sample['speech_tokens'].long()
+            speaker_emb = sample['speaker_emb'].float()
+            prompt_tokens = sample['prompt_tokens'].long()
+            text_tokens = sample['text_tokens'].long()
+
             return {
                 'speech_tokens': speech_tokens,
                 'speaker_emb': speaker_emb,
@@ -69,22 +86,29 @@ class PreprocessedDataset(Dataset):
                 'text_tokens': text_tokens,
             }
         except Exception as e:
-            logger.error(f"Error loading {file_path}: {e}")
+            logger.error(f"Error loading sample {idx}: {e}")
             raise
 
 
 def data_collator_preprocessed(batch):
-    """Collate preprocessed samples into batches."""
-    speech_tokens = torch.stack([item['speech_tokens'] for item in batch])
-    speaker_emb = torch.stack([item['speaker_emb'] for item in batch])
-    prompt_tokens = torch.stack([item['prompt_tokens'] for item in batch])
-    text_tokens = torch.stack([item['text_tokens'] for item in batch])
-    
+    """Collate preprocessed samples into batches with padding for variable-length tokens."""
+    # Pad variable-length sequences
+    speech_tokens = pad_sequence([item['speech_tokens'] for item in batch], batch_first=True, padding_value=0)
+    speaker_emb = torch.stack([item['speaker_emb'] for item in batch])  # Fixed size, can stack
+    prompt_tokens = torch.stack([item['prompt_tokens'] for item in batch])  # Fixed size, can stack
+    text_tokens = pad_sequence([item['text_tokens'] for item in batch], batch_first=True, padding_value=0)
+
+    # Create attention masks for variable-length sequences
+    speech_attention_mask = (speech_tokens != 0).long()
+    text_attention_mask = (text_tokens != 0).long()
+
     return {
         'speech_tokens': speech_tokens,
         'speaker_emb': speaker_emb,
         'prompt_tokens': prompt_tokens,
         'text_tokens': text_tokens,
+        'speech_attention_mask': speech_attention_mask,
+        'text_attention_mask': text_attention_mask,
     }
 
 
